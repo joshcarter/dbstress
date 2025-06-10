@@ -114,6 +114,7 @@ func main() {
 	}
 
 	fmt.Printf("==== dbstress starting ====\n")
+	fmt.Printf(" servers:          %v\n", cluster.Hosts)
 	fmt.Printf(" starting rows:    %d\n", db.rows)
 	fmt.Printf(" concurrency:      %d\n", db.concurrency)
 	fmt.Printf(" partitions:       %d\n", db.partitions)
@@ -326,7 +327,11 @@ func (db *DB) SelectMany() (int, error) {
 	wg.Wait()
 	elapsed := time.Since(start).Seconds()
 
-	return int(float64(totalScanned.Load()) / elapsed), nil
+	// not returning this because the numbers are high enough that it throws the graphs off
+	// return int(float64(totalScanned.Load()) / elapsed), nil
+
+	// instead return the rate of total scans / elapsed time
+	return int(float64(db.concurrency) / elapsed), nil
 }
 
 func (db *DB) InterTestDelay() {
@@ -402,9 +407,6 @@ func (db *DB) PsvGenerator(startingRows int64, includeValue bool) chan *PSV {
 
 	return ch
 }
-
-// `CREATE KEYSPACE IF NOT EXISTS dbstress WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : '2' };`,
-// `USE dbstress;`,
 
 var schema = []string{
 	`CREATE TABLE kv (

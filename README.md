@@ -1,5 +1,13 @@
 # DBStress
 
+Post Cassandra install setup, using cqlsh:
+
+CREATE KEYSPACE IF NOT EXISTS dbstress WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : '2' };
+USE dbstress;
+
+
+
+
 to do:
 
 - log database size (get from Cassandra itself?)
