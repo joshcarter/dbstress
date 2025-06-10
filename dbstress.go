@@ -10,9 +10,12 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gocql/gocql"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
 )
 
 const (
@@ -24,27 +27,62 @@ const (
 type DB struct {
 	*log.Logger
 	session     *gocql.Session
+	servers     []string
 	concurrency int
 	partitions  int
 	valueLen    int
 	opsPerIter  int
+	delay       time.Duration
 	rows        int64
-	notify      chan os.Signal
 	bwLog       io.WriteCloser
 }
 
 func main() {
+	// Set up flags
+	pflag.StringSlice("servers", []string{"localhost"}, "Comma-separated list of Cassandra server IPs or hostnames")
+	pflag.String("keyspace", "dbstress", "Cassandra keyspace")
+	pflag.String("username", "cassandra", "Cassandra username")
+	pflag.String("password", "cassandra", "Cassandra password")
+	pflag.Int("port", 9042, "Cassandra port")
+	pflag.Int("concurrency", 100, "Number of concurrent goroutines")
+	pflag.Int("partitions", 100, "Number of database partitions")
+	pflag.Int("ops", 10000, "Number of database operations per iteration")
+	pflag.String("valuelen", "1024", "Size of each database value (e.g. '1KiB')")
+	pflag.String("delay", "0s", "Delay between tests (e.g. '500ms', '1s')")
+	pflag.Parse()
+
+	// Bind flags to viper
+	viper.BindPFlags(pflag.CommandLine)
+
+	// Enable config file support
+	viper.SetConfigName("config") // name of config file (without extension)
+	viper.SetConfigType("json")   // or "yaml"
+	viper.AddConfigPath(".")      // look in current directory
+
+	// Read in the config file if present
+	if err := viper.ReadInConfig(); err == nil {
+		fmt.Printf("Using config file: %s\n", viper.ConfigFileUsed())
+	}
+
+	servers := viper.GetStringSlice("servers")
+
+	delay, err := time.ParseDuration(viper.GetString("delay"))
+	if err != nil {
+		log.Fatalf("Invalid delay duration: %s", err)
+	}
+
 	// Connect to Cassandra
-	cluster := gocql.NewCluster("127.0.0.1") // Seed node
-	cluster.Port = 9042
-	cluster.Keyspace = "dbstress"
+	cluster := gocql.NewCluster(servers...)
+	cluster.Port = viper.GetInt("port")
+	cluster.Keyspace = viper.GetString("keyspace")
 	cluster.Consistency = gocql.LocalQuorum
 	cluster.Timeout = 5 * time.Second
 	cluster.DisableInitialHostLookup = true
 	cluster.IgnorePeerAddr = true
+	cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
 	cluster.Authenticator = gocql.PasswordAuthenticator{
-		Username: "cassandra",
-		Password: "cassandra",
+		Username: viper.GetString("username"),
+		Password: viper.GetString("password"),
 	}
 
 	session, err := cluster.CreateSession()
@@ -64,12 +102,13 @@ func main() {
 	db := &DB{
 		Logger:      log.Default(),
 		session:     session,
-		concurrency: 100,
-		partitions:  100,
-		valueLen:    1024,
-		opsPerIter:  1000,
+		servers:     servers,
+		concurrency: viper.GetInt("concurrency"),
+		partitions:  viper.GetInt("partitions"),
+		valueLen:    int(viper.GetSizeInBytes("valuelen")),
+		opsPerIter:  viper.GetInt("ops"),
+		delay:       delay,
 		rows:        0,
-		notify:      make(chan os.Signal, 1),
 		bwLog:       bwLog,
 	}
 
@@ -80,18 +119,26 @@ func main() {
 	}
 
 	fmt.Printf("==== dbstress starting ====\n")
-	fmt.Printf(" starting rows: %d\n", db.rows)
-	fmt.Printf(" value len:     %d\n", db.valueLen)
+	fmt.Printf(" starting rows:    %d\n", db.rows)
+	fmt.Printf(" concurrency:      %d\n", db.concurrency)
+	fmt.Printf(" partitions:       %d\n", db.partitions)
+	fmt.Printf(" value len:        %d\n", db.valueLen)
+	fmt.Printf(" inter-test delay: %s\n", db.delay)
 
 	// db.DumpPartitionSizes()
 	// return
 
+	db.Run()
+}
+
+func (db *DB) Run() {
 	// Register for control-C
-	signal.Notify(db.notify, os.Interrupt)
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
 
 	for {
 		select {
-		case <-db.notify:
+		case <-interrupt:
 			fmt.Printf("Control-C; exiting with %d rows.\n", db.rows)
 			return
 		default:
@@ -102,10 +149,13 @@ func main() {
 				os.Exit(1)
 			}
 
+			db.InterTestDelay()
+
 			srate := 0
 			srate2 := 0
 
-			if db.rows%10000 == 0 {
+			// Only do get/scan tests every 100K ops
+			if db.rows%100000 == 0 {
 				srate, err = db.SelectOne()
 
 				if err != nil {
@@ -113,12 +163,16 @@ func main() {
 					os.Exit(1)
 				}
 
+				db.InterTestDelay()
+
 				srate2, err = db.SelectMany()
 
 				if err != nil {
 					fmt.Println(err)
 					os.Exit(1)
 				}
+
+				db.InterTestDelay()
 			}
 
 			if srate > 0 {
@@ -191,7 +245,7 @@ func (db *DB) Insert() (int, error) {
 		sem <- struct{}{} // acquire
 		go func(psv *PSV) {
 			err := db.session.Query(`INSERT INTO kv (p, s, v) VALUES (?, ?, ?)`,
-				psv.p, psv.s, psv.v).Exec()
+				psv.p, psv.s, psv.v).Consistency(gocql.LocalQuorum).Exec()
 
 			if err != nil {
 				fmt.Printf("error inserting entry: %s", err)
@@ -208,7 +262,7 @@ func (db *DB) Insert() (int, error) {
 
 	// Update the row count
 	db.rows += int64(db.opsPerIter)
-	err := db.session.Query(`UPDATE rows SET rows = ? WHERE id = ?`, db.rows, 0).Exec()
+	err := db.session.Query(`UPDATE rows SET rows = ? WHERE id = ?`, db.rows, 0).Consistency(gocql.LocalQuorum).Exec()
 
 	if err != nil {
 		return 0, fmt.Errorf("error updating row count: %s", err)
@@ -236,7 +290,7 @@ func (db *DB) SelectOne() (int, error) {
 		sem <- struct{}{} // acquire
 		go func(psv *PSV) {
 			var value []byte
-			err := db.session.Query(`SELECT v FROM kv WHERE p = ? AND s = ?`, psv.p, psv.s).Scan(&value)
+			err := db.session.Query(`SELECT v FROM kv WHERE p = ? AND s = ?`, psv.p, psv.s).Consistency(gocql.One).Scan(&value)
 
 			if err != nil {
 				fmt.Printf("select error for p=%s s=%s: %w", psv.p, psv.s, err)
@@ -253,19 +307,38 @@ func (db *DB) SelectOne() (int, error) {
 }
 
 func (db *DB) SelectMany() (int, error) {
-	partition := fmt.Sprintf("part-%d", rand.IntN(db.partitions))
-	numScanned := 0
+	totalScanned := atomic.Int64{}
+	sem := make(chan struct{}, db.concurrency)
+	var wg sync.WaitGroup
 	start := time.Now()
 
-	iter := db.session.Query(`SELECT s, v FROM kv WHERE p = ? LIMIT ?`, partition, db.opsPerIter).Iter()
-	var s string
-	var v []byte
-	for iter.Scan(&s, &v) {
-		numScanned++
+	for range db.opsPerIter / db.concurrency {
+		wg.Add(1)
+		sem <- struct{}{} // acquire
+		go func() {
+			numScanned := int64(0)
+			partition := fmt.Sprintf("part-%d", rand.IntN(db.partitions))
+			iter := db.session.Query(`SELECT s, v FROM kv WHERE p = ? LIMIT ?`, partition, db.opsPerIter/db.concurrency).Consistency(gocql.One).Iter()
+			var s string
+			var v []byte
+			for iter.Scan(&s, &v) {
+				numScanned++
+			}
+
+			<-sem // release
+			wg.Done()
+			totalScanned.Add(numScanned)
+		}()
 	}
 
 	elapsed := time.Since(start).Seconds()
-	return int(float64(numScanned) / elapsed), nil
+	return int(float64(totalScanned.Load()) / elapsed), nil
+}
+
+func (db *DB) InterTestDelay() {
+	if db.delay > 0 {
+		time.Sleep(db.delay)
+	}
 }
 
 func (db *DB) DumpPartitionSizes() error {
@@ -335,6 +408,7 @@ var schema = []string{
   	   v blob,
        PRIMARY KEY (p, s)
 	);`,
+	`ALTER TABLE kv WITH compaction = {'class': 'LeveledCompactionStrategy'};`,
 	`CREATE TABLE rows (
     	id int primary key, -- always 0
     	rows bigint
