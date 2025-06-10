@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand/v2"
+	"math/rand"
+	randv2 "math/rand/v2"
 	"os"
 	"os/signal"
 	"strings"
@@ -16,12 +17,6 @@ import (
 	"github.com/gocql/gocql"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
-)
-
-const (
-	Insert      = 0
-	Select      = 1
-	SelectMulti = 2
 )
 
 type DB struct {
@@ -308,16 +303,14 @@ func (db *DB) SelectOne() (int, error) {
 
 func (db *DB) SelectMany() (int, error) {
 	totalScanned := atomic.Int64{}
-	sem := make(chan struct{}, db.concurrency)
 	var wg sync.WaitGroup
 	start := time.Now()
 
-	for range db.opsPerIter / db.concurrency {
+	for range db.concurrency {
 		wg.Add(1)
-		sem <- struct{}{} // acquire
 		go func() {
 			numScanned := int64(0)
-			partition := fmt.Sprintf("part-%d", rand.IntN(db.partitions))
+			partition := fmt.Sprintf("part-%d", randv2.IntN(db.partitions))
 			iter := db.session.Query(`SELECT s, v FROM kv WHERE p = ? LIMIT ?`, partition, db.opsPerIter/db.concurrency).Consistency(gocql.One).Iter()
 			var s string
 			var v []byte
@@ -325,13 +318,14 @@ func (db *DB) SelectMany() (int, error) {
 				numScanned++
 			}
 
-			<-sem // release
 			wg.Done()
 			totalScanned.Add(numScanned)
 		}()
 	}
 
+	wg.Wait()
 	elapsed := time.Since(start).Seconds()
+
 	return int(float64(totalScanned.Load()) / elapsed), nil
 }
 
@@ -368,11 +362,20 @@ type PSV struct {
 }
 
 func (db *DB) PsvGenerator(startingRows int64, includeValue bool) chan *PSV {
-	// These need to be deterministic so that select queries will work
-	partitionGenerator := NewNumberSequence()
-	partitionGenerator.Seed(int64(startingRows))
+	// NOTE generator needs to be deterministic so that select queries will work
+
+	// Create a Zipf distribution to introduce hotspots
+	rng := rand.New(rand.NewSource(int64(startingRows)))
+	zipf := rand.NewZipf(rng, 2.0, 1.0, uint64(db.partitions-1))
+	// Use Go 2 RNG for deterministic hotspot selection
+	rngv2 := randv2.New(randv2.NewPCG(uint64(startingRows), uint64(startingRows)*2+1))
+	hotspot := rngv2.IntN(db.partitions)
+
+	// Sort keys will be pseudo-random letters
 	sortGenerator := NewLetterSequence(0)
 	sortGenerator.Seed(uint64(startingRows))
+
+	// Values will be pseudo-random bytes
 	valueGenerator := NewByteSequence(0)
 	valueGenerator.Seed(uint64(startingRows))
 
@@ -382,7 +385,9 @@ func (db *DB) PsvGenerator(startingRows int64, includeValue bool) chan *PSV {
 		for i := 0; i < db.opsPerIter; i++ {
 			psv := &PSV{}
 
-			psv.p = fmt.Sprintf("part-%d", int(partitionGenerator.Next())%db.partitions)
+			// Compute an offset from the hotspot using Zipf and wrap into valid range
+			offset := int(zipf.Uint64()) % db.partitions
+			psv.p = fmt.Sprintf("part-%d", (hotspot+offset)%db.partitions)
 			psv.s = sortGenerator.Letters(64)
 
 			if includeValue {
