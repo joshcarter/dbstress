@@ -229,6 +229,8 @@ func (db *DB) LoadSchema() error {
 	return nil
 }
 
+var insertRetryPolicy = NewRetryPolicy(3, 10*time.Millisecond, 1.2, func(e error) error { return nil })
+
 func (db *DB) Insert() (int, error) {
 	entries := db.PsvGenerator(db.rows, true)
 	sem := make(chan struct{}, db.concurrency)
@@ -240,8 +242,11 @@ func (db *DB) Insert() (int, error) {
 		wg.Add(1)
 		sem <- struct{}{} // acquire
 		go func(psv *PSV) {
-			err := db.session.Query(`INSERT INTO kv (p, s, v) VALUES (?, ?, ?)`,
-				psv.p, psv.s, psv.v).Consistency(gocql.LocalQuorum).Exec()
+			// Retry here because I'm very occasionally seeing long latency spikes that cause insert to time out
+			err := insertRetryPolicy.Retry(func() error {
+				return db.session.Query(`INSERT INTO kv (p, s, v) VALUES (?, ?, ?)`,
+					psv.p, psv.s, psv.v).Consistency(gocql.LocalQuorum).Exec()
+			})
 
 			if err != nil {
 				fmt.Printf("error inserting entry: %s", err)
