@@ -17,6 +17,7 @@ import (
 	"github.com/gocql/gocql"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"github.com/dustin/go-humanize"
 )
 
 type DB struct {
@@ -115,7 +116,7 @@ func main() {
 
 	fmt.Printf("==== dbstress starting ====\n")
 	fmt.Printf(" servers:          %v\n", cluster.Hosts)
-	fmt.Printf(" starting rows:    %d\n", db.rows)
+	fmt.Printf(" starting rows:    %s\n", humanize.Comma(db.rows))
 	fmt.Printf(" concurrency:      %d\n", db.concurrency)
 	fmt.Printf(" partitions:       %d\n", db.partitions)
 	fmt.Printf(" value len:        %d\n", db.valueLen)
@@ -173,10 +174,10 @@ func (db *DB) Run() {
 
 			if srate > 0 {
 				_, _ = fmt.Fprintf(db.bwLog, "%d, %d, %d, %d\n", db.rows, irate, srate, srate2)
-				fmt.Printf(" - %d rows, insert %d rows/sec, select %d rows/sec, many %d rows/sec\n", db.rows, irate, srate, srate2)
+				fmt.Printf(" - %s, insert %d rows/sec, select %d rows/sec, many %d rows/sec\n", humanize.SI(float64(db.rows), "rows"), irate, srate, srate2)
 			} else {
 				_, _ = fmt.Fprintf(db.bwLog, "%d, %d, NA, NA\n", db.rows, irate)
-				fmt.Printf(" - %d rows, insert %d rows/sec\n", db.rows, irate)
+				fmt.Printf(" - %s, insert %d rows/sec\n", humanize.SI(float64(db.rows), "rows"), irate)
 			}
 		}
 	}
